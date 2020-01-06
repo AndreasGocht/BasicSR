@@ -1,3 +1,7 @@
+import logging
+logger = logging.getLogger('base')
+
+
 def create_model(opt):
     model = opt['model']
 
@@ -5,12 +9,10 @@ def create_model(opt):
         from .SR_model import SRModel as M
     elif model == 'srgan':
         from .SRGAN_model import SRGANModel as M
-    elif model == 'srragan':
-        from .SRRaGAN_model import SRRaGANModel as M
     elif model == 'sftgan':
         from .SFTGAN_ACD_model import SFTGAN_ACD_Model as M
     else:
         raise NotImplementedError('Model [{:s}] not recognized.'.format(model))
     m = M(opt)
-    print('Model [{:s}] is created.'.format(m.__class__.__name__))
+    logger.info('Model [{:s}] is created.'.format(m.__class__.__name__))
     return m

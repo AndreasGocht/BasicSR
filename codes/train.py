@@ -1,111 +1,186 @@
-import os.path
-import sys
+import os
 import math
 import argparse
-import time
 import random
-from collections import OrderedDict
+import logging
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from data.data_sampler import DistIterSampler
 
 import options.options as option
 from utils import util
 from data import create_dataloader, create_dataset
 from models import create_model
-from utils.logger import Logger, PrintLogger
+
+
+def init_dist(backend='nccl', **kwargs):
+    ''' initialization for distributed training'''
+    # if mp.get_start_method(allow_none=True) is None:
+    if mp.get_start_method(allow_none=True) != 'spawn':
+        mp.set_start_method('spawn')
+    rank = int(os.environ['RANK'])
+    num_gpus = torch.cuda.device_count()
+    torch.cuda.set_device(rank % num_gpus)
+    dist.init_process_group(backend=backend, **kwargs)
 
 
 def main():
-    # options
+    #### options
     parser = argparse.ArgumentParser()
-    parser.add_argument('-opt', type=str, required=True, help='Path to option JSON file.')
-    opt = option.parse(parser.parse_args().opt, is_train=True)
+    parser.add_argument('-opt', type=str, help='Path to option YMAL file.')
+    parser.add_argument('--launcher', choices=['none', 'pytorch'], default='none',
+                        help='job launcher')
+    parser.add_argument('--local_rank', type=int, default=0)
+    args = parser.parse_args()
+    opt = option.parse(args.opt, is_train=True)
 
-    util.mkdir_and_rename(opt['path']['experiments_root'])  # rename old experiments if exists
-    util.mkdirs((path for key, path in opt['path'].items() if not key == 'experiments_root' and \
-        not key == 'pretrain_model_G' and not key == 'pretrain_model_D'))
-    option.save(opt)
-    opt = option.dict_to_nonedict(opt)  # Convert to NoneDict, which return None for missing key.
+    #### distributed training settings
+    if args.launcher == 'none':  # disabled distributed training
+        opt['dist'] = False
+        rank = -1
+        print('Disabled distributed training.')
+    else:
+        opt['dist'] = True
+        init_dist()
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
 
-    # print to file and std_out simultaneously
-    sys.stdout = PrintLogger(opt['path']['log'])
+    #### loading resume state if exists
+    if opt['path'].get('resume_state', None):
+        # distributed resuming: all load into default GPU
+        device_id = torch.cuda.current_device()
+        resume_state = torch.load(opt['path']['resume_state'],
+                                  map_location=lambda storage, loc: storage.cuda(device_id))
+        option.check_resume(opt, resume_state['iter'])  # check resume options
+    else:
+        resume_state = None
 
-    # random seed
+    #### mkdir and loggers
+    if rank <= 0:  # normal training (rank -1) OR distributed training (rank 0)
+        if resume_state is None:
+            util.mkdir_and_rename(
+                opt['path']['experiments_root'])  # rename experiment folder if exists
+            util.mkdirs((path for key, path in opt['path'].items() if not key == 'experiments_root'
+                         and 'pretrain_model' not in key and 'resume' not in key))
+
+        # config loggers. Before it, the log will not work
+        util.setup_logger('base', opt['path']['log'], 'train_' + opt['name'], level=logging.INFO,
+                          screen=True, tofile=True)
+        util.setup_logger('val', opt['path']['log'], 'val_' + opt['name'], level=logging.INFO,
+                          screen=True, tofile=True)
+        logger = logging.getLogger('base')
+        logger.info(option.dict2str(opt))
+        # tensorboard logger
+        if opt['use_tb_logger'] and 'debug' not in opt['name']:
+            version = float(torch.__version__[0:3])
+            if version >= 1.1:  # PyTorch 1.1
+                from torch.utils.tensorboard import SummaryWriter
+            else:
+                logger.info(
+                    'You are using PyTorch {}. Tensorboard will use [tensorboardX]'.format(version))
+                from tensorboardX import SummaryWriter
+            tb_logger = SummaryWriter(log_dir='../tb_logger/' + opt['name'])
+    else:
+        util.setup_logger('base', opt['path']['log'], 'train', level=logging.INFO, screen=True)
+        logger = logging.getLogger('base')
+
+    # convert to NoneDict, which returns None for missing keys
+    opt = option.dict_to_nonedict(opt)
+
+    #### random seed
     seed = opt['train']['manual_seed']
     if seed is None:
         seed = random.randint(1, 10000)
-    print("Random Seed: ", seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
+    if rank <= 0:
+        logger.info('Random seed: {}'.format(seed))
+    util.set_random_seed(seed)
 
-    # create train and val dataloader
+    torch.backends.cudnn.benchmark = True
+    # torch.backends.cudnn.deterministic = True
+
+    #### create train and val dataloader
+    dataset_ratio = 200  # enlarge the size of each epoch
     for phase, dataset_opt in opt['datasets'].items():
         if phase == 'train':
             train_set = create_dataset(dataset_opt)
             train_size = int(math.ceil(len(train_set) / dataset_opt['batch_size']))
-            print('Number of train images: {:,d}, iters: {:,d}'.format(len(train_set), train_size))
             total_iters = int(opt['train']['niter'])
-            total_epoches = int(math.ceil(total_iters / train_size))
-            print('Total epoches needed: {:d} for iters {:,d}'.format(total_epoches, total_iters))
-            train_loader = create_dataloader(train_set, dataset_opt)
+            total_epochs = int(math.ceil(total_iters / train_size))
+            if opt['dist']:
+                train_sampler = DistIterSampler(train_set, world_size, rank, dataset_ratio)
+                total_epochs = int(math.ceil(total_iters / (train_size * dataset_ratio)))
+            else:
+                train_sampler = None
+            train_loader = create_dataloader(train_set, dataset_opt, opt, train_sampler)
+            if rank <= 0:
+                logger.info('Number of train images: {:,d}, iters: {:,d}'.format(
+                    len(train_set), train_size))
+                logger.info('Total epochs needed: {:d} for iters {:,d}'.format(
+                    total_epochs, total_iters))
         elif phase == 'val':
-            val_dataset_opt = dataset_opt
             val_set = create_dataset(dataset_opt)
-            val_loader = create_dataloader(val_set, dataset_opt)
-            print('Number of val images in [{:s}]: {:d}'.format(dataset_opt['name'], len(val_set)))
+            val_loader = create_dataloader(val_set, dataset_opt, opt, None)
+            if rank <= 0:
+                logger.info('Number of val images in [{:s}]: {:d}'.format(
+                    dataset_opt['name'], len(val_set)))
         else:
             raise NotImplementedError('Phase [{:s}] is not recognized.'.format(phase))
     assert train_loader is not None
 
-    # Create model
+    #### create model
     model = create_model(opt)
-    # create logger
-    logger = Logger(opt)
 
-    current_step = 0
-    start_time = time.time()
-    print('---------- Start training -------------')
-    for epoch in range(total_epoches):
-        for i, train_data in enumerate(train_loader):
+    #### resume training
+    if resume_state:
+        logger.info('Resuming training from epoch: {}, iter: {}.'.format(
+            resume_state['epoch'], resume_state['iter']))
+
+        start_epoch = resume_state['epoch']
+        current_step = resume_state['iter']
+        model.resume_training(resume_state)  # handle optimizers and schedulers
+    else:
+        current_step = 0
+        start_epoch = 0
+
+    #### training
+    logger.info('Start training from epoch: {:d}, iter: {:d}'.format(start_epoch, current_step))
+    for epoch in range(start_epoch, total_epochs + 1):
+        if opt['dist']:
+            train_sampler.set_epoch(epoch)
+        for _, train_data in enumerate(train_loader):
             current_step += 1
             if current_step > total_iters:
                 break
+            #### update learning rate
+            model.update_learning_rate(current_step, warmup_iter=opt['train']['warmup_iter'])
 
-            # training
+            #### training
             model.feed_data(train_data)
             model.optimize_parameters(current_step)
 
-            time_elapsed = time.time() - start_time
-            start_time = time.time()
-
-            # log
+            #### log
             if current_step % opt['logger']['print_freq'] == 0:
                 logs = model.get_current_log()
-                print_rlt = OrderedDict()
-                print_rlt['model'] = opt['model']
-                print_rlt['epoch'] = epoch
-                print_rlt['iters'] = current_step
-                print_rlt['time'] = time_elapsed
+                message = '<epoch:{:3d}, iter:{:8,d}, lr:{:.3e}> '.format(
+                    epoch, current_step, model.get_current_learning_rate())
                 for k, v in logs.items():
-                    print_rlt[k] = v
-                print_rlt['lr'] = model.get_current_learning_rate()
-                logger.print_format_results('train', print_rlt)
-
-            # save models
-            if current_step % opt['logger']['save_checkpoint_freq'] == 0:
-                print('Saving the model at the end of iter {:d}.'.format(current_step))
-                model.save(current_step)
+                    message += '{:s}: {:.4e} '.format(k, v)
+                    # tensorboard logger
+                    if opt['use_tb_logger'] and 'debug' not in opt['name']:
+                        if rank <= 0:
+                            tb_logger.add_scalar(k, v, current_step)
+                if rank <= 0:
+                    logger.info(message)
 
             # validation
-            if current_step % opt['train']['val_freq'] == 0:
-                print('---------- validation -------------')
-                start_time = time.time()
-
+            if current_step % opt['train']['val_freq'] == 0 and rank <= 0:
                 avg_psnr = 0.0
                 idx = 0
                 for val_data in val_loader:
                     idx += 1
-                    img_name = os.path.splitext(os.path.basename(val_data['LR_path'][0]))[0]
+                    img_name = os.path.splitext(os.path.basename(val_data['LQ_path'][0]))[0]
                     img_dir = os.path.join(opt['path']['val_images'], img_name)
                     util.mkdir(img_dir)
 
@@ -114,11 +189,11 @@ def main():
 
                     visuals = model.get_current_visuals()
                     sr_img = util.tensor2img(visuals['SR'])  # uint8
-                    gt_img = util.tensor2img(visuals['HR'])  # uint8
+                    gt_img = util.tensor2img(visuals['GT'])  # uint8
 
                     # Save SR images for reference
-                    save_img_path = os.path.join(img_dir, '{:s}_{:d}.png'.format(\
-                        img_name, current_step))
+                    save_img_path = os.path.join(img_dir,
+                                                 '{:s}_{:d}.png'.format(img_name, current_step))
                     util.save_img(sr_img, save_img_path)
 
                     # calculate PSNR
@@ -130,29 +205,28 @@ def main():
                     avg_psnr += util.calculate_psnr(cropped_sr_img * 255, cropped_gt_img * 255)
 
                 avg_psnr = avg_psnr / idx
-                time_elapsed = time.time() - start_time
-                # Save to log
-                print_rlt = OrderedDict()
-                print_rlt['model'] = opt['model']
-                print_rlt['epoch'] = epoch
-                print_rlt['iters'] = current_step
-                print_rlt['time'] = time_elapsed
-                print_rlt['psnr'] = avg_psnr
-                logger.print_format_results('val', print_rlt)
-                print('-----------------------------------')
 
-            # update learning rate
-            model.update_learning_rate()
+                # log
+                logger.info('# Validation # PSNR: {:.4e}'.format(avg_psnr))
+                logger_val = logging.getLogger('val')  # validation logger
+                logger_val.info('<epoch:{:3d}, iter:{:8,d}> psnr: {:.4e}'.format(
+                    epoch, current_step, avg_psnr))
+                # tensorboard logger
+                if opt['use_tb_logger'] and 'debug' not in opt['name']:
+                    tb_logger.add_scalar('psnr', avg_psnr, current_step)
 
-    print('Saving the final model.')
-    model.save('latest')
-    print('End of training.')
+            #### save models and training states
+            if current_step % opt['logger']['save_checkpoint_freq'] == 0:
+                if rank <= 0:
+                    logger.info('Saving models and training states.')
+                    model.save(current_step)
+                    model.save_training_state(epoch, current_step)
+
+    if rank <= 0:
+        logger.info('Saving the final model.')
+        model.save('latest')
+        logger.info('End of training.')
 
 
 if __name__ == '__main__':
-    # # OpenCV get stuck in transform when used in DataLoader
-    # # https://github.com/pytorch/pytorch/issues/1838
-    # # However, cause problem reading lmdb
-    # import torch.multiprocessing as mp
-    # mp.set_start_method('spawn', force=True)
     main()

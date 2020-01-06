@@ -1,4 +1,4 @@
-import os
+import logging
 from collections import OrderedDict
 
 import torch
@@ -8,6 +8,8 @@ from torch.optim import lr_scheduler
 import models.networks as networks
 from .base_model import BaseModel
 from models.modules.loss import GANLoss, GradientPenaltyLoss
+
+logger = logging.getLogger('base')
 
 
 class SFTGAN_ACD_Model(BaseModel):
@@ -36,7 +38,7 @@ class SFTGAN_ACD_Model(BaseModel):
                     raise NotImplementedError('Loss type [{:s}] not recognized.'.format(l_pix_type))
                 self.l_pix_w = train_opt['pixel_weight']
             else:
-                print('Remove pixel loss.')
+                logging.info('Remove pixel loss.')
                 self.cri_pix = None
 
             # G feature loss
@@ -50,7 +52,7 @@ class SFTGAN_ACD_Model(BaseModel):
                     raise NotImplementedError('Loss type [{:s}] not recognized.'.format(l_fea_type))
                 self.l_fea_w = train_opt['feature_weight']
             else:
-                print('Remove feature loss.')
+                logging.info('Remove feature loss.')
                 self.cri_fea = None
             if self.cri_fea:  # load VGG perceptual loss
                 self.netF = networks.define_F(opt, use_bn=False).to(self.device)
@@ -82,33 +84,35 @@ class SFTGAN_ACD_Model(BaseModel):
                     optim_params_SFT.append(v)
                 else:
                     optim_params_other.append(v)
-            self.optimizer_G_SFT = torch.optim.Adam(optim_params_SFT, lr=train_opt['lr_G']*5, \
-                weight_decay=wd_G, betas=(train_opt['beta1_G'], 0.999))
-            self.optimizer_G_other = torch.optim.Adam(optim_params_other, lr=train_opt['lr_G'], \
-                weight_decay=wd_G, betas=(train_opt['beta1_G'], 0.999))
+            self.optimizer_G_SFT = torch.optim.Adam(optim_params_SFT, lr=train_opt['lr_G'] * 5,
+                                                    weight_decay=wd_G,
+                                                    betas=(train_opt['beta1_G'], 0.999))
+            self.optimizer_G_other = torch.optim.Adam(optim_params_other, lr=train_opt['lr_G'],
+                                                      weight_decay=wd_G,
+                                                      betas=(train_opt['beta1_G'], 0.999))
             self.optimizers.append(self.optimizer_G_SFT)
             self.optimizers.append(self.optimizer_G_other)
             # D
             wd_D = train_opt['weight_decay_D'] if train_opt['weight_decay_D'] else 0
-            self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=train_opt['lr_D'], \
-                weight_decay=wd_D, betas=(train_opt['beta1_D'], 0.999))
+            self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=train_opt['lr_D'],
+                                                weight_decay=wd_D,
+                                                betas=(train_opt['beta1_D'], 0.999))
             self.optimizers.append(self.optimizer_D)
 
             # schedulers
             if train_opt['lr_scheme'] == 'MultiStepLR':
                 for optimizer in self.optimizers:
-                    self.schedulers.append(lr_scheduler.MultiStepLR(optimizer, \
-                        train_opt['lr_steps'], train_opt['lr_gamma']))
+                    self.schedulers.append(
+                        lr_scheduler.MultiStepLR(optimizer, train_opt['lr_steps'],
+                                                 train_opt['lr_gamma']))
             else:
                 raise NotImplementedError('MultiStepLR learning rate scheme is enough.')
 
             self.log_dict = OrderedDict()
-
-        print('---------- Model initialized ------------------')
+        # print network
         self.print_network()
-        print('-----------------------------------------------')
 
-    def feed_data(self, data, need_HR=True):
+    def feed_data(self, data, need_GT=True):
         # LR
         self.var_L = data['LR'].to(self.device)
         # seg
@@ -116,8 +120,8 @@ class SFTGAN_ACD_Model(BaseModel):
         # category
         self.var_cat = data['category'].long().to(self.device)
 
-        if need_HR:  # train or val
-            self.var_H = data['HR'].to(self.device)
+        if need_GT:  # train or val
+            self.var_H = data['GT'].to(self.device)
 
     def optimize_parameters(self, step):
         # G
@@ -203,48 +207,59 @@ class SFTGAN_ACD_Model(BaseModel):
     def get_current_log(self):
         return self.log_dict
 
-    def get_current_visuals(self, need_HR=True):
+    def get_current_visuals(self, need_GT=True):
         out_dict = OrderedDict()
         out_dict['LR'] = self.var_L.detach()[0].float().cpu()
         out_dict['SR'] = self.fake_H.detach()[0].float().cpu()
-        if need_HR:
-            out_dict['HR'] = self.var_H.detach()[0].float().cpu()
+        if need_GT:
+            out_dict['GT'] = self.var_H.detach()[0].float().cpu()
         return out_dict
 
     def print_network(self):
         # G
         s, n = self.get_network_description(self.netG)
-        print('Number of parameters in G: {:,d}'.format(n))
-        if self.is_train:
-            message = '-------------- Generator --------------\n' + s + '\n'
-            network_path = os.path.join(self.save_dir, '../', 'network.txt')
-            with open(network_path, 'w') as f:
-                f.write(message)
+        if isinstance(self.netG, nn.DataParallel):
+            net_struc_str = '{} - {}'.format(self.netG.__class__.__name__,
+                                             self.netG.module.__class__.__name__)
+        else:
+            net_struc_str = '{}'.format(self.netG.__class__.__name__)
 
+        logger.info('Network G structure: {}, with parameters: {:,d}'.format(net_struc_str, n))
+        logger.info(s)
+        if self.is_train:
             # D
             s, n = self.get_network_description(self.netD)
-            print('Number of parameters in D: {:,d}'.format(n))
-            message = '\n\n\n-------------- Discriminator --------------\n' + s + '\n'
-            with open(network_path, 'a') as f:
-                f.write(message)
+            if isinstance(self.netD, nn.DataParallel):
+                net_struc_str = '{} - {}'.format(self.netD.__class__.__name__,
+                                                 self.netD.module.__class__.__name__)
+            else:
+                net_struc_str = '{}'.format(self.netD.__class__.__name__)
+
+            logger.info('Network D structure: {}, with parameters: {:,d}'.format(net_struc_str, n))
+            logger.info(s)
 
             if self.cri_fea:  # F, Perceptual Network
                 s, n = self.get_network_description(self.netF)
-                print('Number of parameters in F: {:,d}'.format(n))
-                message = '\n\n\n-------------- Perceptual Network --------------\n' + s + '\n'
-                with open(network_path, 'a') as f:
-                    f.write(message)
+                if isinstance(self.netF, nn.DataParallel):
+                    net_struc_str = '{} - {}'.format(self.netF.__class__.__name__,
+                                                     self.netF.module.__class__.__name__)
+                else:
+                    net_struc_str = '{}'.format(self.netF.__class__.__name__)
+
+                logger.info('Network F structure: {}, with parameters: {:,d}'.format(
+                    net_struc_str, n))
+                logger.info(s)
 
     def load(self):
         load_path_G = self.opt['path']['pretrain_model_G']
         if load_path_G is not None:
-            print('loading model for G [{:s}] ...'.format(load_path_G))
-            self.load_network(load_path_G, self.netG)
+            logger.info('Loading pretrained model for G [{:s}] ...'.format(load_path_G))
+            self.load_network(load_path_G, self.netG, self.opt['path']['strict_load'])
         load_path_D = self.opt['path']['pretrain_model_D']
         if self.opt['is_train'] and load_path_D is not None:
-            print('loading model for D [{:s}] ...'.format(load_path_D))
-            self.load_network(load_path_D, self.netD)
+            logger.info('Loading pretrained model for D [{:s}] ...'.format(load_path_D))
+            self.load_network(load_path_D, self.netD, self.opt['path']['strict_load'])
 
-    def save(self, iter_label):
-        self.save_network(self.save_dir, self.netG, 'G', iter_label)
-        self.save_network(self.save_dir, self.netD, 'D', iter_label)
+    def save(self, iter_step):
+        self.save_network(self.netG, 'G', iter_step)
+        self.save_network(self.netD, 'D', iter_step)
